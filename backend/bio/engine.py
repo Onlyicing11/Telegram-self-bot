@@ -1,53 +1,39 @@
 """
-Bio Engine — timezone-synchronized Telegram bio cron.
+Bio Engine — renders the Telegram profile bio ("about") using a template.
+
+Architecture change: the bio engine no longer runs its own cron loop.
+Instead it registers an updater with the shared Profile Scheduler
+(backend.profile.scheduler). The scheduler fires once per minute at
+HH:MM:00 and calls all registered updaters in a single pass, sending
+ONE UpdateProfileRequest to Telegram.
+
+The bio engine controls ONLY the "about" field. It is completely
+independent from the username engine.
 
 Guarantees:
-- Fires exactly at xx:xx:00 by sleeping to the next minute boundary.
-- Deduplicates: skips the Telegram API call when the rendered string
-  has not changed since the last confirmed update.
-- FloodWaitError is caught and slept precisely; all other errors are
-  logged as warnings so the loop never terminates on Telegram throttles.
-- API calls have a 30s timeout to prevent hangs on stalled connections.
-- The cron loop is supervised: if it exits unexpectedly, it restarts
-  with exponential backoff + jitter.
-- stop_cron is deterministic: cancels the task and awaits its termination,
-  guaranteeing the old cron is completely dead before returning.
-- Only one updater task can exist at a time (start_cron is idempotent).
+- Deduplicates: returns None when the rendered string has not changed.
+- FloodWaitError handling is done by the shared scheduler.
+- start_cron / stop_cron delegate to the shared scheduler.
+- Only one scheduler task can exist at a time (idempotent start).
 - Timezone resolved via zoneinfo with UTC fallback — never crashes.
 """
 import asyncio
-import time
 import logging
-import random
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from telethon.errors import FloodWaitError
-from telethon.tl.functions.account import UpdateProfileRequest
-
 from backend.db import client as db_client
 from backend.diagnostics import record_event
-from backend.runtime.tracer import trace, trace_exception
-from backend.runtime.task_guard import guarded_create_task
+from backend.profile import scheduler as profile_scheduler
+from backend.runtime.tracer import trace
 
 logger = logging.getLogger(__name__)
 
-_task: asyncio.Task | None = None
-_API_TIMEOUT = 30
-_BACKOFF_BASE = 2.0
-_BACKOFF_MAX = 60.0
-_BACKOFF_JITTER = 0.3
 _STOP_TIMEOUT = 10.0
-
-
-def _backoff(attempt: int) -> float:
-    base = min(_BACKOFF_MAX, _BACKOFF_BASE * (2 ** attempt))
-    jitter = random.uniform(-_BACKOFF_JITTER, _BACKOFF_JITTER) * base
-    return max(1.0, base + jitter)
+_registered = False
 
 
 def _get_tz(tz_str: str):
-    """Resolve a timezone — zoneinfo first, UTC fallback."""
     try:
         return ZoneInfo(tz_str)
     except (ZoneInfoNotFoundError, Exception):
@@ -66,143 +52,55 @@ def render_bio(template: str, mood: str, text: str, tz_str: str) -> str:
     )
 
 
-def _seconds_to_next_minute(tz) -> float:
-    now = datetime.now(tz)
-    wait = 60.0 - now.second - now.microsecond / 1_000_000
-    if wait <= 0:
-        wait += 60.0
-    return wait
+async def _bio_updater(owner_id: int, tz_str: str) -> dict[str, str] | None:
+    """Called by the shared profile scheduler each minute.
 
+    Returns ``{"about": rendered_bio}`` if the bio changed, or ``None``
+    if it hasn't (deduplication). Also persists the new bio to the DB.
+    """
+    state = await db_client.get_bio_state(owner_id)
+    if not state or not state.get("is_active"):
+        return None
 
-async def _cron_loop(client, owner_id: int, tz_str: str) -> None:
+    tmpl = state.get("template", "🕒 {time} | 💭 {mood}")
+    mood = state.get("mood", "😊")
+    ctxtxt = state.get("custom_text", "")
+
+    new_bio = render_bio(tmpl, mood, ctxtxt, tz_str)
+    last_bio = state.get("last_bio")
+
+    if new_bio == (last_bio or ""):
+        return None
+
     tz = _get_tz(tz_str)
-    trace("BIO_CRON_STARTED", tz=tz_str)
-    logger.info("Bio cron started (tz=%s)", tz_str)
-
-    while True:
-        await asyncio.sleep(_seconds_to_next_minute(tz))
-
-        try:
-            state = await db_client.get_bio_state(owner_id)
-
-            if not state or not state.get("is_active"):
-                trace("BIO_CRON_STOPPED", reason="is_active_false")
-                logger.info("Bio cron: is_active=False — stopping loop.")
-                return
-
-            tmpl = state.get("template", "🕒 {time} | 💭 {mood}")
-            mood = state.get("mood", "😊")
-            ctxtxt = state.get("custom_text", "")
-
-            new_bio = render_bio(tmpl, mood, ctxtxt, tz_str)
-
-            last_bio = state.get("last_bio")
-
-            if new_bio == (last_bio or ""):
-                continue
-
-            t0 = time.monotonic()
-            try:
-                await asyncio.wait_for(
-                    client(UpdateProfileRequest(about=new_bio)),
-                    timeout=_API_TIMEOUT,
-                )
-                record_event("bio", "UpdateProfileRequest", (time.monotonic() - t0) * 1000, "SUCCESS")
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "Bio API call timed out (%ds) — will retry next minute",
-                    _API_TIMEOUT,
-                )
-                record_event("bio", "UpdateProfileRequest", _API_TIMEOUT * 1000, "TIMEOUT")
-                continue
-            except FloodWaitError as fwe:
-                logger.warning("Bio FloodWait %ds — sleeping.", fwe.seconds)
-                record_event("bio", "UpdateProfileRequest", 0, "FLOOD_WAIT", f"{fwe.seconds}s")
-                await asyncio.sleep(fwe.seconds + 1)
-                continue
-            except asyncio.CancelledError:
-                raise
-            except Exception as api_exc:
-                logger.exception(
-                    "Bio API error (retrying next minute): type=%s repr=%r",
-                    type(api_exc).__name__, api_exc,
-                )
-                record_event("bio", "UpdateProfileRequest", 0, "ERROR", str(api_exc))
-                continue
-
-            await db_client.update_bio_state(owner_id, {
-                "last_bio": new_bio,
-                "updated_at": datetime.now(tz).isoformat(),
-            })
-
-            try:
-                from backend.health import set_last_bio_update
-                set_last_bio_update()
-            except Exception:
-                pass
-
-        except asyncio.CancelledError:
-            trace("BIO_CRON_CANCELLED")
-            logger.info("Bio cron cancelled.")
-            raise
-        except Exception as exc:
-            trace_exception("BIO_CRON_TICK_ERROR", exc)
-            logger.exception("Bio cron tick error (will retry next minute)")
+    await db_client.update_bio_state(owner_id, {
+        "last_bio": new_bio,
+        "updated_at": datetime.now(tz).isoformat(),
+    })
+    return {"about": new_bio}
 
 
-async def _supervised_cron(client, owner_id: int, tz_str: str) -> None:
-    """Supervisor: restarts _cron_loop if it exits unexpectedly."""
-    attempt = 0
-    while True:
-        try:
-            await _cron_loop(client, owner_id, tz_str)
-            trace("BIO_CRON_SUPERVISOR_EXIT", reason="loop_exited_normally")
-            logger.info("Bio cron supervisor: loop exited normally.")
-            return
-        except asyncio.CancelledError:
-            trace("BIO_CRON_SUPERVISOR_CANCELLED")
-            raise
-        except Exception as exc:
-            attempt += 1
-            delay = _backoff(attempt)
-            trace_exception("BIO_CRON_CRASHED", exc, attempt=attempt, backoff_delay=delay)
-            logger.exception(
-                "Bio cron crashed unexpectedly — restarting in %.1fs: %s",
-                delay, exc,
-            )
-            await asyncio.sleep(delay)
+def _ensure_registered() -> None:
+    global _registered
+    if _registered:
+        return
+    profile_scheduler.register_updater("bio", _bio_updater)
+    _registered = True
 
 
 def start_cron(client, owner_id: int, tz_str: str) -> None:
-    global _task
-    if _task and not _task.done():
-        return
-    _task = guarded_create_task(
-        _supervised_cron(client, owner_id, tz_str),
-        name="lifeos-bio-cron",
-    )
+    _ensure_registered()
+    profile_scheduler.start_cron(client, owner_id, tz_str)
     trace("BIO_CRON_START_REQUESTED")
     record_event("bio", "start_cron", 0, "SUCCESS")
 
 
 async def stop_cron() -> None:
-    """Deterministic stop: cancel and await the cron task.
-
-    Guarantees the old cron is completely dead before returning.
-    """
-    global _task
-    if _task and not _task.done():
-        trace("BIO_CRON_STOP_REQUESTED")
-        _task.cancel()
-        try:
-            await asyncio.wait_for(_task, timeout=_STOP_TIMEOUT)
-        except (asyncio.CancelledError, asyncio.TimeoutError):
-            pass
-        except Exception:
-            pass
-    _task = None
+    """Stop the shared profile scheduler (which serves all engines)."""
+    trace("BIO_CRON_STOP_REQUESTED")
+    await profile_scheduler.stop_cron()
     record_event("bio", "stop_cron", 0, "SUCCESS")
 
 
 def is_running() -> bool:
-    return bool(_task and not _task.done())
+    return profile_scheduler.is_running()
